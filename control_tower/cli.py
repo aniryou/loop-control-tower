@@ -58,11 +58,51 @@ def main(argv: list[str] | None = None) -> int:
         help="emit one JSON object instead of plain-text tables",
     )
 
+    watch_p = sub.add_parser(
+        "watch", help="open a live TUI dashboard tailing the event log"
+    )
+    watch_p.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help=(
+            "path to the NDJSON event log "
+            "(default: $LOOP_EVENT_LOG or /tmp/loop-events-<session>.jsonl)"
+        ),
+    )
+    watch_p.add_argument(
+        "--from-start",
+        dest="from_start",
+        action="store_true",
+        help="replay the existing file before tailing (default: tail from end)",
+    )
+    watch_p.add_argument(
+        "--poll-interval-s",
+        dest="poll_interval_s",
+        type=float,
+        default=0.1,
+        help="seconds between tail polls (default: 0.1)",
+    )
+
     args = parser.parse_args(argv)
     if args.cmd == "stats":
         return _cmd_stats(args)
+    if args.cmd == "watch":
+        return _cmd_watch(args)
     parser.error(f"unknown command: {args.cmd}")
     return 2  # unreachable — parser.error raises SystemExit
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """Lazy-imports textual so ``stats`` doesn't pay the import cost."""
+    path = Path(args.path) if args.path else default_event_log_path()
+    from control_tower.watch import run_watch
+
+    return run_watch(
+        path,
+        from_start=args.from_start,
+        poll_interval_s=args.poll_interval_s,
+    )
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
