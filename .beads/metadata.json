@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "loop_control_tower",
+  "project_id": "9d1a671b-9ae0-4e30-be97-a4b142d26bdc"
+}
