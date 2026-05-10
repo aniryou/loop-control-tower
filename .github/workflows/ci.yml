@@ -15,8 +15,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dev dependencies
-        run: pip install pre-commit pytest
+      - name: Install dependencies
+        run: |
+          pip install pre-commit pytest
+          pip install -r requirements.txt
 
       - name: Run pre-commit
         run: pre-commit run --all-files --show-diff-on-failure
