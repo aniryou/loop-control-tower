@@ -87,13 +87,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     watch_p.add_argument(
         "--view",
-        choices=["all", "pulse", "ticker", "stats"],
+        choices=["all", "pulse", "ticker", "stats", "cycle", "failures"],
         default="all",
         help=(
             "which pane to render — 'all' (default) is the three-region "
             "dashboard; 'pulse'/'ticker'/'stats' are single-purpose panes "
-            "intended for tiling under tmux (see scripts/dashboard.sh)"
+            "intended for tiling under tmux (see scripts/dashboard.sh); "
+            "'cycle' and 'failures' are drill-down views typically opened "
+            "via 'tmux display-popup' from a base view"
         ),
+    )
+    watch_p.add_argument(
+        "--cycle-id",
+        dest="cycle_id",
+        default=None,
+        help="cycle_id to filter on — required when --view=cycle",
     )
 
     args = parser.parse_args(argv)
@@ -107,14 +115,25 @@ def main(argv: list[str] | None = None) -> int:
 
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Lazy-imports textual so ``stats`` doesn't pay the import cost."""
+    if args.view == "cycle" and not args.cycle_id:
+        print(
+            "error: --view=cycle requires --cycle-id <id>",
+            file=sys.stderr,
+        )
+        return 2
+    # Drill-down popups replay the whole log — the user wouldn't open them
+    # otherwise. Base views keep the caller's --from-start choice.
+    from_start = args.from_start or args.view in ("cycle", "failures")
+
     path = Path(args.path) if args.path else default_event_log_path()
     from control_tower.watch import run_watch
 
     return run_watch(
         path,
-        from_start=args.from_start,
+        from_start=from_start,
         poll_interval_s=args.poll_interval_s,
         view=args.view,
+        filter_cycle_id=args.cycle_id,
     )
 
 

@@ -674,3 +674,242 @@ def test_view_stats_refresh_counters_does_not_crash_without_other_widgets(
             assert pane._cs["dev-1"].ok == 1
 
     asyncio.run(_go())
+
+
+# --- drill-down views (loop-control-tower-255) -------------------------
+
+
+def test_is_failure_event_classifies_the_three_failure_classes() -> None:
+    from control_tower.watch import _is_failure_event
+
+    def _e(**kw: Any):
+        return _parsed(_ev(**kw))  # type: ignore[arg-type]
+
+    assert _is_failure_event(_e(event="hard_failure", cycle_id="c1"))
+    assert _is_failure_event(_e(event="lock_race_lost", cycle_id="c1"))
+    assert _is_failure_event(_e(event="cycle_end", cycle_id="c1", exit_code=2))
+    # NOT failures:
+    assert not _is_failure_event(_e(event="cycle_end", cycle_id="c1", exit_code=0))
+    assert not _is_failure_event(_e(event="cycle_skip", cycle_id="c1"))
+    assert not _is_failure_event(_e(event="cycle_start", cycle_id="c1"))
+    assert not _is_failure_event(_e(event="llm_started", cycle_id="c1"))
+
+
+def test_view_cycle_requires_filter_cycle_id(tmp_path: Path) -> None:
+    """WatchApp(view=cycle) without a cycle_id is a misconfiguration."""
+    from control_tower.watch import WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    try:
+        WatchApp(log, view="cycle")
+    except ValueError:
+        return
+    raise AssertionError("view=cycle without filter_cycle_id should raise")
+
+
+def test_view_cycle_filters_to_one_cycle_id_chronologically(tmp_path: Path) -> None:
+    """Events for other cycles are dropped; matching events arrive oldest-first."""
+    from control_tower.watch import EventTicker, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(
+            log,
+            from_start=True,
+            poll_interval_s=0.05,
+            view="cycle",
+            filter_cycle_id="c1",
+        )
+        async with app.run_test():
+            # interleave c1, c2 events
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c1")))
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c2")))
+            app.feed_event(_parsed(_ev("llm_started", cycle_id="c1", run_id="r1")))
+            app.feed_event(_parsed(_ev("llm_started", cycle_id="c2", run_id="r2")))
+            app.feed_event(
+                _parsed(_ev("cycle_end", cycle_id="c1", exit_code=0, duration_s=1.0))
+            )
+
+            ticker = app.query_one("#ticker", EventTicker)
+            assert ticker.oldest_first is True
+            # only c1's three events made it in
+            assert len(ticker.events) == 3
+            events_in_order = [ev.event for ev in ticker.events]
+            assert events_in_order == ["cycle_start", "llm_started", "cycle_end"]
+
+    asyncio.run(_go())
+
+
+def test_view_failures_admits_only_failure_family_events(tmp_path: Path) -> None:
+    from control_tower.watch import EventTicker, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="failures")
+        async with app.run_test():
+            # success events: should NOT appear
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="ok1")))
+            app.feed_event(
+                _parsed(_ev("cycle_end", cycle_id="ok1", exit_code=0, duration_s=1.0))
+            )
+            app.feed_event(_parsed(_ev("cycle_skip", cycle_id="skip1")))
+            app.feed_event(_parsed(_ev("llm_started", cycle_id="ok1", run_id="r")))
+            # failure events: SHOULD appear
+            app.feed_event(
+                _parsed(_ev("hard_failure", cycle_id="hf1", reason="max-turns"))
+            )
+            app.feed_event(
+                _parsed(_ev("cycle_end", cycle_id="f1", exit_code=2, duration_s=1.0))
+            )
+            app.feed_event(_parsed(_ev("lock_race_lost", cycle_id="lr1")))
+
+            ticker = app.query_one("#ticker", EventTicker)
+            assert ticker.oldest_first is False  # newest-first for live failures
+            assert len(ticker.events) == 3
+            assert {ev.event for ev in ticker.events} == {
+                "hard_failure",
+                "cycle_end",
+                "lock_race_lost",
+            }
+            # newest-first: the lock_race_lost we pushed last is at index 0
+            assert ticker.events[0].event == "lock_race_lost"
+
+    asyncio.run(_go())
+
+
+def test_in_tmux_detects_TMUX_env_var(monkeypatch: Any) -> None:
+    from control_tower.watch import _in_tmux
+
+    monkeypatch.delenv("TMUX", raising=False)
+    assert _in_tmux() is False
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
+    assert _in_tmux() is True
+
+
+def test_spawn_tmux_popup_invokes_tmux_display_popup(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The helper shells out to ``tmux display-popup -E -- <argv>``."""
+    import control_tower.watch as watch_mod
+
+    captured: dict[str, Any] = {}
+
+    class _FakePopen:
+        def __init__(self, cmd: list[str], **kwargs: Any) -> None:
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(watch_mod.subprocess, "Popen", _FakePopen)
+
+    watch_mod._spawn_tmux_popup(
+        ["python", "-m", "control_tower", "watch", "--view=failures"],
+        title="failures",
+    )
+
+    cmd = captured["cmd"]
+    assert cmd[:3] == ["tmux", "display-popup", "-E"]
+    assert "-T" in cmd and cmd[cmd.index("-T") + 1] == "failures"
+    assert "--" in cmd
+    tail = cmd[cmd.index("--") + 1 :]
+    assert tail == ["python", "-m", "control_tower", "watch", "--view=failures"]
+    assert captured["kwargs"].get("start_new_session") is True
+
+
+def test_action_open_failures_outside_tmux_notifies_user(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Pressing 'f' outside tmux shows a fallback message, no subprocess."""
+    import control_tower.watch as watch_mod
+    from control_tower.watch import WatchApp
+
+    monkeypatch.delenv("TMUX", raising=False)
+
+    calls: list[list[str]] = []
+
+    def _fail_popen(*args: Any, **kwargs: Any) -> None:
+        calls.append(args[0])
+        raise AssertionError("Popen should not be invoked outside tmux")
+
+    monkeypatch.setattr(watch_mod.subprocess, "Popen", _fail_popen)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    notifications: list[str] = []
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+
+        def _capture(msg: str, **kw: Any) -> None:
+            notifications.append(msg)
+
+        async with app.run_test() as pilot:
+            app.notify = _capture  # type: ignore[method-assign]
+            await pilot.press("f")
+            await pilot.pause(0.05)
+
+    asyncio.run(_go())
+    assert calls == []
+    assert any("tmux" in n.lower() for n in notifications)
+
+
+def test_action_open_failures_inside_tmux_spawns_subprocess(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    import control_tower.watch as watch_mod
+    from control_tower.watch import WatchApp
+
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
+
+    captured: list[list[str]] = []
+
+    class _FakePopen:
+        def __init__(self, cmd: list[str], **kwargs: Any) -> None:
+            captured.append(cmd)
+
+    monkeypatch.setattr(watch_mod.subprocess, "Popen", _FakePopen)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test() as pilot:
+            await pilot.press("f")
+            await pilot.pause(0.05)
+
+    asyncio.run(_go())
+    assert len(captured) == 1
+    cmd = captured[0]
+    assert cmd[0] == "tmux"
+    tail = cmd[cmd.index("--") + 1 :]
+    assert "--view=failures" in tail
+    assert "--from-start" in tail
+    assert str(log) in tail
+
+
+def test_ticker_oldest_first_orders_appends_correctly() -> None:
+    """oldest_first=True appends rather than appendleft."""
+    from control_tower.events import Event
+    from control_tower.watch import EventTicker
+
+    t = EventTicker(oldest_first=True)
+    for i in range(3):
+        t.push(
+            Event(
+                ts=f"2026-05-10T10:00:0{i}+00:00",
+                session="s",
+                repo="o/r",
+                role="dev-1",
+                event="cycle_start",
+                schema_version=2,
+                extra={"cycle_id": f"c{i}"},
+            )
+        )
+    assert [e.extra["cycle_id"] for e in t.events] == ["c0", "c1", "c2"]

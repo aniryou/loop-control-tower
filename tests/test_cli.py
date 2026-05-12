@@ -239,6 +239,67 @@ def test_watch_view_rejects_unknown_value(
     assert "banana" in err or "invalid choice" in err
 
 
+def test_watch_view_cycle_without_cycle_id_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--view=cycle without --cycle-id is a clean exit-2 with a stderr hint."""
+    from control_tower import cli
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    rc = cli.main(["watch", "--view=cycle", str(log)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--cycle-id" in err
+
+
+def test_watch_view_cycle_passes_cycle_id_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    rc = cli.main(["watch", "--view=cycle", "--cycle-id=abc123", str(log)])
+    assert rc == 0
+    assert captured["view"] == "cycle"
+    assert captured["filter_cycle_id"] == "abc123"
+    # cycle/failures views auto-enable from_start regardless of caller
+    assert captured["from_start"] is True
+
+
+def test_watch_view_failures_auto_enables_from_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    cli.main(["watch", "--view=failures", str(log)])
+    assert captured["view"] == "failures"
+    assert captured["from_start"] is True
+    assert captured["filter_cycle_id"] is None
+
+
 def test_module_main_importable_without_executing() -> None:
     """Importing control_tower.__main__ must NOT execute main() (guard with __name__)."""
     import control_tower.__main__  # noqa: F401

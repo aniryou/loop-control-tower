@@ -25,7 +25,10 @@ Keys: ``q`` quit, ``c`` clear ticker, ``p`` pause auto-scroll, ``?`` help.
 
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -65,13 +68,62 @@ class View(str, Enum):
     """Which widgets ``WatchApp`` composes.
 
     ``ALL`` (default) is the legacy three-region layout. The single-purpose
-    views are designed to be tiled by tmux — see ``scripts/dashboard.sh``.
+    views are designed to be tiled by tmux — see ``scripts/dashboard.sh`` —
+    or to be opened as ephemeral ``tmux display-popup`` drill-downs from a
+    base view.
     """
 
     ALL = "all"
     PULSE = "pulse"
     TICKER = "ticker"
     STATS = "stats"
+    CYCLE = "cycle"
+    FAILURES = "failures"
+
+
+FAILURE_EVENT_NAMES = frozenset({"hard_failure", "lock_race_lost"})
+
+
+def _in_tmux() -> bool:
+    """``True`` iff the current process is running inside a tmux session."""
+    return bool(os.environ.get("TMUX"))
+
+
+def _spawn_tmux_popup(
+    argv: list[str],
+    *,
+    title: str | None = None,
+    width: str = "80%",
+    height: str = "80%",
+) -> None:
+    """Fire-and-forget ``tmux display-popup -E <argv>``.
+
+    The popup is its own process with its own log tail and its own lifetime;
+    closing it (``q`` or Esc) does not touch the launching pane. ``-E``
+    closes the popup automatically when the inner command exits.
+    """
+    cmd = ["tmux", "display-popup", "-E", "-w", width, "-h", height]
+    if title is not None:
+        cmd += ["-T", title]
+    cmd.append("--")
+    cmd.extend(argv)
+    # Detach with start_new_session so the popup outlives the parent's
+    # event-loop callback frame cleanly.
+    subprocess.Popen(cmd, start_new_session=True)
+
+
+def _is_failure_event(ev: Event) -> bool:
+    """Match the failure-family the ``failures`` view foregrounds.
+
+    Three classes count: any ``hard_failure``, any ``lock_race_lost``, and
+    a ``cycle_end`` that closed non-zero. ``cycle_skip`` is intentionally
+    *not* a failure — it's the dispatcher saying 'no work', not a fault.
+    """
+    if ev.event in FAILURE_EVENT_NAMES:
+        return True
+    if ev.event == "cycle_end":
+        return ev.extra.get("exit_code") not in (0, None)
+    return False
 
 
 @dataclass
@@ -190,14 +242,21 @@ class StatusRow(Static):
 
 
 class EventTicker(Static):
-    """Middle region — rolling ``TICKER_MAX``-event window, newest at top."""
+    """Middle region — rolling ``TICKER_MAX``-event window.
+
+    ``oldest_first=False`` (default) puts the newest event at the top —
+    the live-tail behaviour. ``oldest_first=True`` is for sequence views
+    (e.g., ``--view=cycle``) where reading top-to-bottom *is* reading the
+    chronology.
+    """
 
     DEFAULT_CSS = "EventTicker { height: 1fr; padding: 0 1; }"
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, *, oldest_first: bool = False, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.events: deque[Event] = deque(maxlen=TICKER_MAX)
         self.paused: bool = False
+        self.oldest_first: bool = oldest_first
         self._waiting_for: Path | None = None
 
     def set_waiting(self, path: Path) -> None:
@@ -206,7 +265,10 @@ class EventTicker(Static):
 
     def push(self, ev: Event) -> None:
         self._waiting_for = None
-        self.events.appendleft(ev)
+        if self.oldest_first:
+            self.events.append(ev)
+        else:
+            self.events.appendleft(ev)
         if not self.paused:
             self.refresh_view()
 
@@ -439,6 +501,7 @@ class WatchApp(App):
         Binding("q", "quit", "Quit"),
         Binding("c", "clear_ticker", "Clear"),
         Binding("p", "toggle_pause", "Pause"),
+        Binding("f", "open_failures", "Failures"),
         Binding("question_mark", "help", "Help"),
     ]
 
@@ -449,12 +512,16 @@ class WatchApp(App):
         from_start: bool = False,
         poll_interval_s: float = 0.1,
         view: View | str = View.ALL,
+        filter_cycle_id: str | None = None,
     ) -> None:
         super().__init__()
         self.log_path = log_path
         self.from_start = from_start
         self.poll_interval_s = poll_interval_s
         self.view = view if isinstance(view, View) else View(view)
+        self.filter_cycle_id = filter_cycle_id
+        if self.view == View.CYCLE and not filter_cycle_id:
+            raise ValueError("view=cycle requires filter_cycle_id")
         self._queue: queue.Queue[Event | ParseError] = queue.Queue()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
@@ -479,10 +546,16 @@ class WatchApp(App):
             yield EventTicker(id="ticker")
         elif self._has(View.STATS):
             yield CountersPane(id="counters")
+        elif self._has(View.CYCLE):
+            # Chronological — reading top-to-bottom is reading the cycle.
+            yield EventTicker(id="ticker", oldest_first=True)
+        elif self._has(View.FAILURES):
+            # Newest failure at top, matching live-tail intuition.
+            yield EventTicker(id="ticker")
         yield Footer()
 
     def on_mount(self) -> None:
-        if self._has(View.ALL, View.TICKER):
+        if self._has(View.ALL, View.TICKER, View.CYCLE, View.FAILURES):
             ticker = self.query_one("#ticker", EventTicker)
             if not self.log_path.exists():
                 ticker.set_waiting(self.log_path)
@@ -547,8 +620,17 @@ class WatchApp(App):
                     reason=reason if isinstance(reason, str) else None,
                     ts=item.ts,
                 )
-        if self._has(View.ALL, View.TICKER):
-            self.query_one("#ticker", EventTicker).push(item)
+        if self._has(View.ALL, View.TICKER, View.CYCLE, View.FAILURES):
+            if self._event_matches_filter(item):
+                self.query_one("#ticker", EventTicker).push(item)
+
+    def _event_matches_filter(self, ev: Event) -> bool:
+        """Apply the view's filter; ``ALL``/``TICKER`` accept everything."""
+        if self.view == View.CYCLE:
+            return ev.extra.get("cycle_id") == self.filter_cycle_id
+        if self.view == View.FAILURES:
+            return _is_failure_event(ev)
+        return True
 
     def _update_role_state(self, ev: Event) -> None:
         s = self._role_states.setdefault(ev.role, RoleState(role=ev.role))
@@ -617,16 +699,37 @@ class WatchApp(App):
             self.query_one("#heartbeat", HeartbeatStrip).refresh_view()
 
     def action_clear_ticker(self) -> None:
-        if self._has(View.ALL, View.TICKER):
+        if self._has(View.ALL, View.TICKER, View.CYCLE, View.FAILURES):
             self.query_one("#ticker", EventTicker).clear()
 
     def action_toggle_pause(self) -> None:
-        if self._has(View.ALL, View.TICKER):
+        if self._has(View.ALL, View.TICKER, View.CYCLE, View.FAILURES):
             self.query_one("#ticker", EventTicker).toggle_pause()
+
+    def action_open_failures(self) -> None:
+        """Open the failures view in a tmux popup; notify if no tmux."""
+        if not _in_tmux():
+            self.notify(
+                "drill-down requires tmux; run scripts/dashboard.sh",
+                timeout=4,
+            )
+            return
+        _spawn_tmux_popup(
+            [
+                sys.executable,
+                "-m",
+                "control_tower",
+                "watch",
+                "--view=failures",
+                "--from-start",
+                str(self.log_path),
+            ],
+            title="failures",
+        )
 
     def action_help(self) -> None:
         self.notify(
-            "q quit · c clear ticker · p pause/resume · ? help",
+            "q quit · c clear · p pause · f failures-popup · ? help",
             timeout=5,
         )
 
@@ -642,6 +745,7 @@ def run_watch(
     from_start: bool = False,
     poll_interval_s: float = 0.1,
     view: View | str = View.ALL,
+    filter_cycle_id: str | None = None,
 ) -> int:
     """Open the watch UI on ``path``. Returns the app's exit code (0 on quit)."""
     app = WatchApp(
@@ -649,6 +753,7 @@ def run_watch(
         from_start=from_start,
         poll_interval_s=poll_interval_s,
         view=view,
+        filter_cycle_id=filter_cycle_id,
     )
     app.run()
     return 0
