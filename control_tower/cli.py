@@ -1,8 +1,8 @@
 """``python -m control_tower stats <log>`` — read a log, print operational stats.
 
 The CLI is the first user-visible interface to the typed reader and cycle
-reconstructor. Output is plain text in five fixed-column tables (one per
-aggregator) for grep/awk friendliness; ``--json`` dumps the same five
+reconstructor. Output is plain text in six fixed-column tables (one per
+aggregator) for grep/awk friendliness; ``--json`` dumps the same six
 aggregator outputs as one JSON object for downstream tools.
 
 A missing log file is exit 2 with a one-line stderr message; an empty file
@@ -23,12 +23,14 @@ from control_tower.cycles import Cycle, reconstruct
 from control_tower.events import default_event_log_path, read_file
 from control_tower.stats import (
     DispatchCounts,
+    LLMCostStats,
     LockStats,
     RoleStats,
     at_cap_stats,
     cycle_summary,
     dispatch_stats,
     hard_failure_stats,
+    llm_cost_stats,
     lock_stats,
 )
 
@@ -83,6 +85,24 @@ def main(argv: list[str] | None = None) -> int:
         default=0.1,
         help="seconds between tail polls (default: 0.1)",
     )
+    watch_p.add_argument(
+        "--view",
+        choices=["all", "pulse", "ticker", "stats", "cycle", "failures"],
+        default="all",
+        help=(
+            "which pane to render — 'all' (default) is the three-region "
+            "dashboard; 'pulse'/'ticker'/'stats' are single-purpose panes "
+            "intended for tiling under tmux (see scripts/dashboard.sh); "
+            "'cycle' and 'failures' are drill-down views typically opened "
+            "via 'tmux display-popup' from a base view"
+        ),
+    )
+    watch_p.add_argument(
+        "--cycle-id",
+        dest="cycle_id",
+        default=None,
+        help="cycle_id to filter on — required when --view=cycle",
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "stats":
@@ -95,13 +115,25 @@ def main(argv: list[str] | None = None) -> int:
 
 def _cmd_watch(args: argparse.Namespace) -> int:
     """Lazy-imports textual so ``stats`` doesn't pay the import cost."""
+    if args.view == "cycle" and not args.cycle_id:
+        print(
+            "error: --view=cycle requires --cycle-id <id>",
+            file=sys.stderr,
+        )
+        return 2
+    # Drill-down popups replay the whole log — the user wouldn't open them
+    # otherwise. Base views keep the caller's --from-start choice.
+    from_start = args.from_start or args.view in ("cycle", "failures")
+
     path = Path(args.path) if args.path else default_event_log_path()
     from control_tower.watch import run_watch
 
     return run_watch(
         path,
-        from_start=args.from_start,
+        from_start=from_start,
         poll_interval_s=args.poll_interval_s,
+        view=args.view,
+        filter_cycle_id=args.cycle_id,
     )
 
 
@@ -117,6 +149,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     ds = dispatch_stats(cycles)
     ac = at_cap_stats(cycles)
     hf = hard_failure_stats(cycles)
+    lc = llm_cost_stats(cycles)
 
     if args.as_json:
         payload: dict[str, object] = {
@@ -125,6 +158,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
             "dispatch_stats": {k: dataclasses.asdict(v) for k, v in ds.items()},
             "at_cap_stats": ac,
             "hard_failure_stats": hf,
+            "llm_cost_stats": {k: dataclasses.asdict(v) for k, v in lc.items()},
         }
         json.dump(payload, sys.stdout, sort_keys=True)
         sys.stdout.write("\n")
@@ -139,6 +173,8 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     _print_at_cap_stats(ac)
     print()
     _print_hard_failures(hf)
+    print()
+    _print_llm_cost(lc)
     return 0
 
 
@@ -208,11 +244,31 @@ def _print_at_cap_stats(ac: dict[str, int]) -> None:
     _render_columns(table)
 
 
-def _print_hard_failures(hf: dict[str, int]) -> None:
+def _print_hard_failures(hf: dict[str, dict[str, int]]) -> None:
     print("hard failures")
-    rows = sorted(hf.items())
-    headers = ["role", "count"]
-    table = [headers] + [[k, str(v)] for k, v in rows]
+    headers = ["role", "reason", "count"]
+    rows: list[list[str]] = []
+    for role in sorted(hf):
+        for reason in sorted(hf[role]):
+            rows.append([role, reason, str(hf[role][reason])])
+    _render_columns([headers] + rows)
+
+
+def _print_llm_cost(lc: dict[str, LLMCostStats]) -> None:
+    print("llm cost by role")
+    headers = ["role", "runs", "total_usd", "in_tok", "out_tok", "turns"]
+    rows = sorted(lc.items())
+    table = [headers] + [
+        [
+            role,
+            str(s.runs),
+            f"{s.total_cost_usd:.4f}",
+            str(s.input_tokens),
+            str(s.output_tokens),
+            str(s.num_turns),
+        ]
+        for role, s in rows
+    ]
     _render_columns(table)
 
 

@@ -32,7 +32,7 @@ def _ev(
         "repo": "o/r",
         "role": role,
         "event": event,
-        "schema_version": 1,
+        "schema_version": 2,
         "cycle_id": cycle_id,
     }
     out.update(extra)
@@ -59,7 +59,7 @@ def _five_cycle_log() -> list[dict[str, Any]]:
     return out
 
 
-def test_stats_prints_five_sections_in_fixed_order(
+def test_stats_prints_six_sections_in_fixed_order(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from control_tower.cli import main
@@ -77,6 +77,7 @@ def test_stats_prints_five_sections_in_fixed_order(
         out.find("dispatch fires by pr"),
         out.find("at-cap events by kind"),
         out.find("hard failures"),
+        out.find("llm cost by role"),
     ]
     assert all(p >= 0 for p in positions), f"missing section in output:\n{out}"
     assert positions == sorted(positions), f"sections out of order: {positions}\n{out}"
@@ -138,7 +139,7 @@ def test_stats_missing_file_exits_two_with_stderr(
     assert str(missing) in err
 
 
-def test_stats_json_outputs_one_object_with_five_keys(
+def test_stats_json_outputs_one_object_with_six_keys(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from control_tower.cli import main
@@ -156,6 +157,7 @@ def test_stats_json_outputs_one_object_with_five_keys(
         "dispatch_stats",
         "at_cap_stats",
         "hard_failure_stats",
+        "llm_cost_stats",
     }
     assert payload["cycle_summary"]["dev-1"]["total"] == 5
     assert payload["cycle_summary"]["dev-1"]["ok"] == 3
@@ -177,6 +179,125 @@ def test_stats_default_path_resolves_via_env(
     assert rc == 0
     out = capsys.readouterr().out
     assert "dev-1" in out
+
+
+def test_watch_passes_view_through_to_run_watch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--view=pulse on the CLI reaches run_watch(view='pulse')."""
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured["path"] = path
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    rc = cli.main(["watch", "--view=pulse", str(log)])
+    assert rc == 0
+    assert captured["view"] == "pulse"
+    assert captured["path"] == log
+
+
+def test_watch_view_default_is_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    cli.main(["watch", str(log)])
+    assert captured["view"] == "all"
+
+
+def test_watch_view_rejects_unknown_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from control_tower import cli
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    with pytest.raises(SystemExit):
+        cli.main(["watch", "--view=banana", str(log)])
+    err = capsys.readouterr().err
+    assert "banana" in err or "invalid choice" in err
+
+
+def test_watch_view_cycle_without_cycle_id_exits_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--view=cycle without --cycle-id is a clean exit-2 with a stderr hint."""
+    from control_tower import cli
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    rc = cli.main(["watch", "--view=cycle", str(log)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--cycle-id" in err
+
+
+def test_watch_view_cycle_passes_cycle_id_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    rc = cli.main(["watch", "--view=cycle", "--cycle-id=abc123", str(log)])
+    assert rc == 0
+    assert captured["view"] == "cycle"
+    assert captured["filter_cycle_id"] == "abc123"
+    # cycle/failures views auto-enable from_start regardless of caller
+    assert captured["from_start"] is True
+
+
+def test_watch_view_failures_auto_enables_from_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    cli.main(["watch", "--view=failures", str(log)])
+    assert captured["view"] == "failures"
+    assert captured["from_start"] is True
+    assert captured["filter_cycle_id"] is None
 
 
 def test_module_main_importable_without_executing() -> None:

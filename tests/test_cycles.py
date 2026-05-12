@@ -34,7 +34,7 @@ def _ev(
         repo=repo,
         role=role,
         event=event,
-        schema_version=1,
+        schema_version=2,
         extra=payload,
     )
 

@@ -30,7 +30,7 @@ def _ev(
         "repo": "o/r",
         "role": role,
         "event": event,
-        "schema_version": 1,
+        "schema_version": 2,
         "cycle_id": cycle_id,
     }
     out.update(extra)
@@ -170,6 +170,34 @@ def test_watch_counter_pane_matches_stats_cli_output(tmp_path: Path) -> None:
         _ev("cycle_start", cycle_id="s1"),
         _ev("cycle_skip", cycle_id="s1"),
     ]
+    # v2-only: a hard_failure with reason + an llm_started/llm_exited pair
+    # carrying cost / token fields so the new aggregators are exercised on
+    # both sides of the equality.
+    raw_events += [
+        _ev("cycle_start", cycle_id="hf1"),
+        _ev(
+            "llm_started",
+            cycle_id="hf1",
+            run_id="r1",
+            mode="default",
+            issue=42,
+        ),
+        _ev(
+            "llm_exited",
+            cycle_id="hf1",
+            run_id="r1",
+            mode="default",
+            issue=42,
+            exit_code=1,
+            duration_s=2.5,
+            total_cost_usd=0.1234,
+            input_tokens=1000,
+            output_tokens=200,
+            num_turns=4,
+        ),
+        _ev("hard_failure", cycle_id="hf1", reason="api-error"),
+        _ev("cycle_end", cycle_id="hf1", exit_code=2, duration_s=2.5),
+    ]
     with log.open("w", encoding="utf-8") as fh:
         for raw in raw_events:
             fh.write(json.dumps(raw) + "\n")
@@ -191,6 +219,7 @@ def test_watch_counter_pane_matches_stats_cli_output(tmp_path: Path) -> None:
                 "ds": pane._ds,
                 "ac": pane._ac,
                 "hf": pane._hf,
+                "lc": pane._lc,
             }
 
     pane_data = asyncio.run(_go())
@@ -235,3 +264,20 @@ def test_watch_counter_pane_matches_stats_cli_output(tmp_path: Path) -> None:
 
     assert pane_data["ac"] == cli_payload["at_cap_stats"]
     assert pane_data["hf"] == cli_payload["hard_failure_stats"]
+    # New v2 surfaces — pin role+reason nesting and cost/token totals.
+    assert pane_data["hf"] == {"dev-1": {"api-error": 1}}
+    pane_lc_serialized = {
+        role: {
+            "runs": s.runs,
+            "total_cost_usd": s.total_cost_usd,
+            "input_tokens": s.input_tokens,
+            "output_tokens": s.output_tokens,
+            "num_turns": s.num_turns,
+        }
+        for role, s in pane_data["lc"].items()
+    }
+    assert pane_lc_serialized == cli_payload["llm_cost_stats"]
+    assert pane_data["lc"]["dev-1"].total_cost_usd == 0.1234
+    assert pane_data["lc"]["dev-1"].input_tokens == 1000
+    assert pane_data["lc"]["dev-1"].output_tokens == 200
+    assert pane_data["lc"]["dev-1"].num_turns == 4
