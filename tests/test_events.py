@@ -33,7 +33,7 @@ def _valid_fields(**overrides: object) -> dict[str, object]:
         "repo": "o/r",
         "role": "dev-1",
         "event": "cycle_start",
-        "schema_version": 1,
+        "schema_version": 2,
     }
     base.update(overrides)
     return base
@@ -43,19 +43,19 @@ def _valid_fields(**overrides: object) -> dict[str, object]:
 
 
 def test_supported_schema_version_constant() -> None:
-    assert SUPPORTED_SCHEMA_VERSION == 1
+    assert SUPPORTED_SCHEMA_VERSION == 2
 
 
 def test_parse_event_minimal_valid() -> None:
     line = (
         '{"ts":"2026-05-10T10:00:00+00:00","session":"s","repo":"o/r",'
-        '"role":"dev-1","event":"cycle_start","schema_version":1,'
+        '"role":"dev-1","event":"cycle_start","schema_version":2,'
         '"cycle_id":"123-1"}'
     )
     result = parse_event(line)
     assert isinstance(result, Event)
     assert result.event == "cycle_start"
-    assert result.schema_version == 1
+    assert result.schema_version == 2
     assert result.session == "s"
     assert result.repo == "o/r"
     assert result.role == "dev-1"
@@ -128,15 +128,15 @@ def test_parse_event_json_array_is_invalid() -> None:
 
 
 def test_parse_event_unsupported_schema_version() -> None:
-    line = json.dumps(_valid_fields(schema_version=2))
+    line = json.dumps(_valid_fields(schema_version=99))
     result = parse_event(line)
     assert isinstance(result, ParseError)
     assert result.reason == "unsupported_schema_version"
-    assert result.detail == "2"
+    assert result.detail == "99"
 
 
 def test_parse_event_wrong_type_schema_version_string() -> None:
-    line = json.dumps(_valid_fields(schema_version="1"))
+    line = json.dumps(_valid_fields(schema_version="2"))
     result = parse_event(line)
     assert isinstance(result, ParseError)
     assert result.reason == "wrong_type"

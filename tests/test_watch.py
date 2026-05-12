@@ -29,7 +29,7 @@ def _ev(
         "repo": "o/r",
         "role": role,
         "event": event,
-        "schema_version": 1,
+        "schema_version": 2,
         "cycle_id": cycle_id,
     }
     out.update(extra)

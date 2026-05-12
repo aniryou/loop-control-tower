@@ -12,7 +12,9 @@ read fields off ``Cycle`` and ``Cycle.events``:
 - ``lock_acquired`` / ``lock_race_lost`` from ``Cycle.events`` for the lock-race rate
 - ``dispatch_fired`` / ``dispatch_skip`` from ``Cycle.events`` keyed by ``pr``
 - ``at_cap`` from ``Cycle.events`` keyed by ``kind``
-- ``hard_failure`` from ``Cycle.events`` keyed by emitting role
+- ``hard_failure`` from ``Cycle.events`` keyed by ``(role, reason)``;
+  events without the v2 ``reason`` field fall back to ``"unknown"``
+- ``llm_exited`` cost / token totals from ``Cycle.events`` keyed by role
 
 Stdlib only.
 """
@@ -25,6 +27,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from control_tower.cycles import Cycle
+
+HARD_FAILURE_REASON_FALLBACK = "unknown"
 
 
 @dataclass(frozen=True)
@@ -172,11 +176,90 @@ def at_cap_stats(cycles: Iterable[Cycle]) -> dict[str, int]:
     return dict(out)
 
 
-def hard_failure_stats(cycles: Iterable[Cycle]) -> dict[str, int]:
-    """Count of ``hard_failure`` events keyed by emitting role."""
-    out: dict[str, int] = defaultdict(int)
+def hard_failure_stats(cycles: Iterable[Cycle]) -> dict[str, dict[str, int]]:
+    """Count of ``hard_failure`` events keyed by ``(role, reason)``.
+
+    ``reason`` is the closed enum from schema v2 (``api-error``, ``max-turns``,
+    ``pipeline-crash``, ``mode2-give-up``, ``mode3-give-up``, ``no-result-line``,
+    ``unknown``). Events that arrive without a string ``reason`` extra fall back
+    to :data:`HARD_FAILURE_REASON_FALLBACK` so legacy v1 data and forward-compat
+    surprises are still counted (rather than silently dropped).
+    """
+    out: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for c in cycles:
         for ev in c.events:
-            if ev.event == "hard_failure":
-                out[ev.role] += 1
-    return dict(out)
+            if ev.event != "hard_failure":
+                continue
+            reason = ev.extra.get("reason")
+            key = reason if isinstance(reason, str) else HARD_FAILURE_REASON_FALLBACK
+            out[ev.role][key] += 1
+    return {role: dict(reasons) for role, reasons in out.items()}
+
+
+@dataclass(frozen=True)
+class LLMCostStats:
+    """Per-role totals from ``llm_exited`` events.
+
+    Sums the four schema-v2 required fields (``total_cost_usd``,
+    ``input_tokens``, ``output_tokens``, ``num_turns``) plus a ``runs``
+    count of contributing ``llm_exited`` events. A field that is missing
+    or non-numeric on a given event contributes 0 — the v2 contract
+    guarantees presence, but the aggregator stays defensive.
+    """
+
+    runs: int
+    total_cost_usd: float
+    input_tokens: int
+    output_tokens: int
+    num_turns: int
+
+
+def llm_cost_stats(cycles: Iterable[Cycle]) -> dict[str, LLMCostStats]:
+    """Sum ``llm_exited`` cost / token fields per emitting role.
+
+    Roles that never emitted ``llm_exited`` are absent from the result.
+    """
+    runs: dict[str, int] = defaultdict(int)
+    cost: dict[str, float] = defaultdict(float)
+    in_tok: dict[str, int] = defaultdict(int)
+    out_tok: dict[str, int] = defaultdict(int)
+    turns: dict[str, int] = defaultdict(int)
+
+    for c in cycles:
+        for ev in c.events:
+            if ev.event != "llm_exited":
+                continue
+            runs[ev.role] += 1
+            cost[ev.role] += _as_float(ev.extra.get("total_cost_usd"))
+            in_tok[ev.role] += _as_int(ev.extra.get("input_tokens"))
+            out_tok[ev.role] += _as_int(ev.extra.get("output_tokens"))
+            turns[ev.role] += _as_int(ev.extra.get("num_turns"))
+
+    return {
+        role: LLMCostStats(
+            runs=runs[role],
+            total_cost_usd=cost[role],
+            input_tokens=in_tok[role],
+            output_tokens=out_tok[role],
+            num_turns=turns[role],
+        )
+        for role in runs
+    }
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, bool):  # bool is an int subclass
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+def _as_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return 0

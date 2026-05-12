@@ -35,7 +35,7 @@ def _ev(
         repo=repo,
         role=role,
         event=event,
-        schema_version=1,
+        schema_version=2,
         extra=payload,
     )
 
@@ -70,12 +70,14 @@ def _skip_cycle(cid: str, role: str, dur: float | None = None) -> list[Event]:
 def test_module_imports() -> None:
     from control_tower.stats import (  # noqa: F401
         DispatchCounts,
+        LLMCostStats,
         LockStats,
         RoleStats,
         at_cap_stats,
         cycle_summary,
         dispatch_stats,
         hard_failure_stats,
+        llm_cost_stats,
         lock_stats,
     )
 
@@ -341,22 +343,37 @@ def test_at_cap_stats_ignores_events_without_kind() -> None:
 # --- hard_failure_stats ---------------------------------------------------
 
 
-def test_hard_failure_stats_keyed_by_role() -> None:
+def test_hard_failure_stats_keyed_by_role_and_reason() -> None:
     from control_tower.stats import hard_failure_stats
 
     events = [
         _ev("cycle_start", cycle_id="c1", role="dev-1"),
-        _ev("hard_failure", cycle_id="c1", role="dev-1"),
+        _ev("hard_failure", cycle_id="c1", role="dev-1", reason="api-error"),
         _ev("cycle_end", cycle_id="c1", role="dev-1", exit_code=2, duration_s=1.0),
         _ev("cycle_start", cycle_id="c2", role="dev-2"),
-        _ev("hard_failure", cycle_id="c2", role="dev-2"),
-        _ev("hard_failure", cycle_id="c2", role="dev-2"),
+        _ev("hard_failure", cycle_id="c2", role="dev-2", reason="api-error"),
+        _ev("hard_failure", cycle_id="c2", role="dev-2", reason="max-turns"),
         _ev("cycle_end", cycle_id="c2", role="dev-2", exit_code=2, duration_s=1.0),
     ]
     cycles = list(reconstruct(events))
     out = hard_failure_stats(cycles)
-    assert out["dev-1"] == 1
-    assert out["dev-2"] == 2
+    assert out == {
+        "dev-1": {"api-error": 1},
+        "dev-2": {"api-error": 1, "max-turns": 1},
+    }
+
+
+def test_hard_failure_stats_missing_reason_falls_back_to_unknown() -> None:
+    from control_tower.stats import HARD_FAILURE_REASON_FALLBACK, hard_failure_stats
+
+    events = [
+        _ev("cycle_start", cycle_id="c1", role="dev-1"),
+        _ev("hard_failure", cycle_id="c1", role="dev-1"),  # no reason field
+        _ev("cycle_end", cycle_id="c1", role="dev-1", exit_code=2, duration_s=1.0),
+    ]
+    cycles = list(reconstruct(events))
+    out = hard_failure_stats(cycles)
+    assert out == {"dev-1": {HARD_FAILURE_REASON_FALLBACK: 1}}
 
 
 def test_hard_failure_stats_empty() -> None:
@@ -364,3 +381,94 @@ def test_hard_failure_stats_empty() -> None:
 
     cycles = list(reconstruct(_ok_cycle("c1", "dev-1", 1.0)))
     assert hard_failure_stats(cycles) == {}
+
+
+# --- llm_cost_stats -------------------------------------------------------
+
+
+def test_llm_cost_stats_sums_per_role() -> None:
+    from control_tower.stats import LLMCostStats, llm_cost_stats
+
+    events = [
+        _ev("cycle_start", cycle_id="c1", role="dev-1"),
+        _ev("llm_started", cycle_id="c1", role="dev-1", run_id="r1", mode="default"),
+        _ev(
+            "llm_exited",
+            cycle_id="c1",
+            role="dev-1",
+            run_id="r1",
+            mode="default",
+            exit_code=0,
+            duration_s=1.0,
+            total_cost_usd=0.10,
+            input_tokens=100,
+            output_tokens=50,
+            num_turns=3,
+        ),
+        _ev("cycle_end", cycle_id="c1", role="dev-1", exit_code=0, duration_s=1.0),
+        _ev("cycle_start", cycle_id="c2", role="dev-1"),
+        _ev("llm_started", cycle_id="c2", role="dev-1", run_id="r2", mode="default"),
+        _ev(
+            "llm_exited",
+            cycle_id="c2",
+            role="dev-1",
+            run_id="r2",
+            mode="default",
+            exit_code=0,
+            duration_s=1.0,
+            total_cost_usd=0.05,
+            input_tokens=200,
+            output_tokens=80,
+            num_turns=2,
+        ),
+        _ev("cycle_end", cycle_id="c2", role="dev-1", exit_code=0, duration_s=1.0),
+    ]
+    cycles = list(reconstruct(events))
+    out = llm_cost_stats(cycles)
+    assert set(out.keys()) == {"dev-1"}
+    s = out["dev-1"]
+    assert s.runs == 2
+    assert math.isclose(s.total_cost_usd, 0.15)
+    assert s.input_tokens == 300
+    assert s.output_tokens == 130
+    assert s.num_turns == 5
+    # Keep an explicit type check — float-by-float equality is precision-sensitive.
+    assert isinstance(s, LLMCostStats)
+
+
+def test_llm_cost_stats_missing_fields_default_to_zero() -> None:
+    from control_tower.stats import LLMCostStats, llm_cost_stats
+
+    events = [
+        _ev("cycle_start", cycle_id="c1", role="dev-1"),
+        _ev("llm_started", cycle_id="c1", role="dev-1", run_id="r1", mode="default"),
+        _ev(
+            "llm_exited",
+            cycle_id="c1",
+            role="dev-1",
+            run_id="r1",
+            mode="default",
+            exit_code=0,
+            duration_s=1.0,
+            # Pre-v2 event shape: cost / token fields absent.
+        ),
+        _ev("cycle_end", cycle_id="c1", role="dev-1", exit_code=0, duration_s=1.0),
+    ]
+    cycles = list(reconstruct(events))
+    out = llm_cost_stats(cycles)
+    assert out == {
+        "dev-1": LLMCostStats(
+            runs=1,
+            total_cost_usd=0.0,
+            input_tokens=0,
+            output_tokens=0,
+            num_turns=0,
+        ),
+    }
+
+
+def test_llm_cost_stats_empty_when_no_llm_exited() -> None:
+    from control_tower.stats import llm_cost_stats
+
+    cycles = list(reconstruct(_ok_cycle("c1", "dev-1", 1.0)))
+    assert llm_cost_stats(cycles) == {}

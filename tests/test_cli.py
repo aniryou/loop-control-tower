@@ -32,7 +32,7 @@ def _ev(
         "repo": "o/r",
         "role": role,
         "event": event,
-        "schema_version": 1,
+        "schema_version": 2,
         "cycle_id": cycle_id,
     }
     out.update(extra)
@@ -59,7 +59,7 @@ def _five_cycle_log() -> list[dict[str, Any]]:
     return out
 
 
-def test_stats_prints_five_sections_in_fixed_order(
+def test_stats_prints_six_sections_in_fixed_order(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from control_tower.cli import main
@@ -77,6 +77,7 @@ def test_stats_prints_five_sections_in_fixed_order(
         out.find("dispatch fires by pr"),
         out.find("at-cap events by kind"),
         out.find("hard failures"),
+        out.find("llm cost by role"),
     ]
     assert all(p >= 0 for p in positions), f"missing section in output:\n{out}"
     assert positions == sorted(positions), f"sections out of order: {positions}\n{out}"
@@ -138,7 +139,7 @@ def test_stats_missing_file_exits_two_with_stderr(
     assert str(missing) in err
 
 
-def test_stats_json_outputs_one_object_with_five_keys(
+def test_stats_json_outputs_one_object_with_six_keys(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from control_tower.cli import main
@@ -156,6 +157,7 @@ def test_stats_json_outputs_one_object_with_five_keys(
         "dispatch_stats",
         "at_cap_stats",
         "hard_failure_stats",
+        "llm_cost_stats",
     }
     assert payload["cycle_summary"]["dev-1"]["total"] == 5
     assert payload["cycle_summary"]["dev-1"]["ok"] == 3

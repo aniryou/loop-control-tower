@@ -5,7 +5,7 @@ that follows the event log produced by `aniryou/loop`:
 
 - top: per-role status cards (current cycle, elapsed, current LLM run, last outcome);
 - middle: rolling 50-event ticker, newest at top, coloured by family;
-- bottom: the five aggregate counters that ``python -m control_tower stats``
+- bottom: the six aggregate counters that ``python -m control_tower stats``
   prints, recomputed once per second over cycles seen in this session.
 
 A worker thread runs :func:`control_tower.events.tail_file` and queues parsed
@@ -38,12 +38,14 @@ from control_tower.cycles import Cycle, reconstruct
 from control_tower.events import Event, ParseError, tail_file
 from control_tower.stats import (
     DispatchCounts,
+    LLMCostStats,
     LockStats,
     RoleStats,
     at_cap_stats,
     cycle_summary,
     dispatch_stats,
     hard_failure_stats,
+    llm_cost_stats,
     lock_stats,
 )
 
@@ -215,7 +217,7 @@ class EventTicker(Static):
 
 
 class CountersPane(Static):
-    """Bottom region — five aggregate counters from :mod:`control_tower.stats`."""
+    """Bottom region — six aggregate counters from :mod:`control_tower.stats`."""
 
     DEFAULT_CSS = "CountersPane { height: auto; padding: 0 1; }"
 
@@ -225,7 +227,8 @@ class CountersPane(Static):
         self._ls: dict[str, LockStats] = {}
         self._ds: dict[str, DispatchCounts] = {}
         self._ac: dict[str, int] = {}
-        self._hf: dict[str, int] = {}
+        self._hf: dict[str, dict[str, int]] = {}
+        self._lc: dict[str, LLMCostStats] = {}
 
     def update_counts(self, cycles: list[Cycle]) -> None:
         self._cs = cycle_summary(cycles)
@@ -233,6 +236,7 @@ class CountersPane(Static):
         self._ds = dispatch_stats(cycles)
         self._ac = at_cap_stats(cycles)
         self._hf = hard_failure_stats(cycles)
+        self._lc = llm_cost_stats(cycles)
         self.refresh_view()
 
     def refresh_view(self) -> None:
@@ -263,7 +267,19 @@ class CountersPane(Static):
 
         lines.append("[bold]hard failures[/bold]")
         for role in sorted(self._hf):
-            lines.append(f"  {role}  count={self._hf[role]}")
+            for reason in sorted(self._hf[role]):
+                lines.append(
+                    f"  {role}  reason={reason} count={self._hf[role][reason]}"
+                )
+
+        lines.append("[bold]llm cost by role[/bold]")
+        for role in sorted(self._lc):
+            s = self._lc[role]
+            lines.append(
+                f"  {role}  runs={s.runs} total_usd={s.total_cost_usd:.4f} "
+                f"in_tok={s.input_tokens} out_tok={s.output_tokens} "
+                f"turns={s.num_turns}"
+            )
 
         self.update("\n".join(lines))
 
