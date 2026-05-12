@@ -85,6 +85,16 @@ def main(argv: list[str] | None = None) -> int:
         default=0.1,
         help="seconds between tail polls (default: 0.1)",
     )
+    watch_p.add_argument(
+        "--view",
+        choices=["all", "pulse", "ticker", "stats"],
+        default="all",
+        help=(
+            "which pane to render — 'all' (default) is the three-region "
+            "dashboard; 'pulse'/'ticker'/'stats' are single-purpose panes "
+            "intended for tiling under tmux (see scripts/dashboard.sh)"
+        ),
+    )
 
     args = parser.parse_args(argv)
     if args.cmd == "stats":
@@ -104,6 +114,7 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         path,
         from_start=args.from_start,
         poll_interval_s=args.poll_interval_s,
+        view=args.view,
     )
 
 

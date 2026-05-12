@@ -321,3 +321,356 @@ def test_watch_two_roles_get_independent_cards(tmp_path: Path) -> None:
             assert app._role_states["reviewer-1"].current_cycle_id == "r1"
 
     asyncio.run(_go())
+
+
+# --- view selection (loop-control-tower-1pl) -----------------------------
+
+
+def test_view_ticker_composes_only_the_ticker(tmp_path: Path) -> None:
+    """--view=ticker yields the ticker; not StatusRow / CountersPane / heartbeat."""
+    from textual.css.query import NoMatches
+
+    from control_tower.watch import (
+        CountersPane,
+        EventTicker,
+        FailureAlertStrip,
+        HeartbeatStrip,
+        StatusRow,
+        WatchApp,
+    )
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="ticker")
+        async with app.run_test():
+            assert app.query_one("#ticker", EventTicker) is not None
+            for sel, cls in [
+                ("#status", StatusRow),
+                ("#counters", CountersPane),
+                ("#heartbeat", HeartbeatStrip),
+                ("#failures", FailureAlertStrip),
+            ]:
+                try:
+                    app.query_one(sel, cls)
+                except NoMatches:
+                    continue
+                else:
+                    raise AssertionError(f"{sel} should not exist in ticker view")
+
+    asyncio.run(_go())
+
+
+def test_view_stats_composes_only_the_counters(tmp_path: Path) -> None:
+    from textual.css.query import NoMatches
+
+    from control_tower.watch import CountersPane, EventTicker, StatusRow, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="stats")
+        async with app.run_test():
+            assert app.query_one("#counters", CountersPane) is not None
+            for sel, cls in [("#status", StatusRow), ("#ticker", EventTicker)]:
+                try:
+                    app.query_one(sel, cls)
+                except NoMatches:
+                    continue
+                else:
+                    raise AssertionError(f"{sel} should not exist in stats view")
+
+    asyncio.run(_go())
+
+
+def test_view_pulse_composes_status_and_pulse_widgets(tmp_path: Path) -> None:
+    """--view=pulse yields HeartbeatStrip + StatusRow + FailureAlertStrip — not ticker / counters."""
+    from textual.css.query import NoMatches
+
+    from control_tower.watch import (
+        CountersPane,
+        EventTicker,
+        FailureAlertStrip,
+        HeartbeatStrip,
+        StatusRow,
+        WatchApp,
+    )
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            assert app.query_one("#heartbeat", HeartbeatStrip) is not None
+            assert app.query_one("#status", StatusRow) is not None
+            assert app.query_one("#failures", FailureAlertStrip) is not None
+            for sel, cls in [("#ticker", EventTicker), ("#counters", CountersPane)]:
+                try:
+                    app.query_one(sel, cls)
+                except NoMatches:
+                    continue
+                else:
+                    raise AssertionError(f"{sel} should not exist in pulse view")
+
+    asyncio.run(_go())
+
+
+def test_view_all_default_preserves_legacy_widgets(tmp_path: Path) -> None:
+    """No --view (default 'all') still composes the legacy three regions."""
+    from control_tower.watch import CountersPane, EventTicker, StatusRow, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05)
+        async with app.run_test():
+            assert app.query_one("#status", StatusRow) is not None
+            assert app.query_one("#ticker", EventTicker) is not None
+            assert app.query_one("#counters", CountersPane) is not None
+
+    asyncio.run(_go())
+
+
+def test_view_invalid_value_raises(tmp_path: Path) -> None:
+    from control_tower.watch import WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    try:
+        WatchApp(log, view="banana")
+    except ValueError:
+        return
+    raise AssertionError("invalid view should raise ValueError")
+
+
+# --- heartbeat + parse-error counter (loop-control-tower-1pl) ----------
+
+
+def test_pulse_heartbeat_starts_in_waiting_state(tmp_path: Path) -> None:
+    from control_tower.watch import HeartbeatStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            hb = app.query_one("#heartbeat", HeartbeatStrip)
+            assert hb.last_event_ts is None
+            assert hb.parse_error_count == 0
+
+    asyncio.run(_go())
+
+
+def test_pulse_heartbeat_records_session_and_repo_on_first_event(tmp_path: Path) -> None:
+    from control_tower.watch import HeartbeatStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c1")))
+            hb = app.query_one("#heartbeat", HeartbeatStrip)
+            assert hb.last_event_ts is not None
+            assert hb.session == "s"
+            assert hb.repo == "o/r"
+
+    asyncio.run(_go())
+
+
+def test_pulse_parse_errors_increment_visible_counter(tmp_path: Path) -> None:
+    from control_tower.events import ParseError
+    from control_tower.watch import HeartbeatStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            app.feed_event(ParseError(raw="bogus", reason="invalid_json"))
+            app.feed_event(ParseError(raw="bogus2", reason="invalid_json"))
+            hb = app.query_one("#heartbeat", HeartbeatStrip)
+            assert hb.parse_error_count == 2
+            assert app._parse_error_count == 2
+
+    asyncio.run(_go())
+
+
+def test_pulse_heartbeat_aggregates_update_on_refresh(tmp_path: Path) -> None:
+    """_refresh_counters feeds role / cycle / cost totals into the heartbeat strip."""
+    from control_tower.watch import HeartbeatStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c1", role="dev-1")))
+            app.feed_event(
+                _parsed(
+                    _ev(
+                        "llm_exited",
+                        cycle_id="c1",
+                        role="dev-1",
+                        run_id="r1",
+                        total_cost_usd=0.42,
+                        input_tokens=100,
+                        output_tokens=20,
+                        num_turns=2,
+                    )
+                )
+            )
+            app.feed_event(
+                _parsed(_ev("cycle_end", cycle_id="c1", role="dev-1", exit_code=0, duration_s=1.0))
+            )
+            app._refresh_counters()
+            hb = app.query_one("#heartbeat", HeartbeatStrip)
+            assert hb.role_count == 1
+            assert hb.cycle_count == 1
+            assert abs(hb.total_cost_usd - 0.42) < 1e-9
+
+    asyncio.run(_go())
+
+
+# --- failure alert strip (loop-control-tower-1pl) ----------------------
+
+
+def test_pulse_failure_strip_hidden_until_hard_failure(tmp_path: Path) -> None:
+    from control_tower.watch import FailureAlertStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            fs = app.query_one("#failures", FailureAlertStrip)
+            assert fs.failure_count == 0
+            assert "-active" not in fs.classes
+
+            # cycle_end with non-zero exit_code is NOT a hard_failure
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c1")))
+            app.feed_event(
+                _parsed(_ev("cycle_end", cycle_id="c1", exit_code=2, duration_s=1.0))
+            )
+            assert fs.failure_count == 0
+            assert "-active" not in fs.classes
+
+    asyncio.run(_go())
+
+
+def test_pulse_failure_strip_activates_on_hard_failure(tmp_path: Path) -> None:
+    from control_tower.watch import FailureAlertStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c1")))
+            app.feed_event(
+                _parsed(
+                    _ev(
+                        "hard_failure",
+                        cycle_id="c1",
+                        role="dev-1",
+                        reason="max-turns",
+                    )
+                )
+            )
+            fs = app.query_one("#failures", FailureAlertStrip)
+            assert fs.failure_count == 1
+            assert fs.last_role == "dev-1"
+            assert fs.last_reason == "max-turns"
+            assert "-active" in fs.classes
+
+            # subsequent failures increment + replace 'last'
+            app.feed_event(
+                _parsed(
+                    _ev(
+                        "hard_failure",
+                        cycle_id="c1",
+                        role="reviewer-1",
+                        reason="api-error",
+                    )
+                )
+            )
+            assert fs.failure_count == 2
+            assert fs.last_role == "reviewer-1"
+            assert fs.last_reason == "api-error"
+
+    asyncio.run(_go())
+
+
+def test_pulse_failure_strip_falls_back_to_unknown_when_reason_missing(
+    tmp_path: Path,
+) -> None:
+    """v1 events without a reason field still surface in the alert strip."""
+    from control_tower.watch import FailureAlertStrip, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="pulse")
+        async with app.run_test():
+            app.feed_event(
+                _parsed(_ev("hard_failure", cycle_id="c1", role="dev-1"))
+            )
+            fs = app.query_one("#failures", FailureAlertStrip)
+            assert fs.last_reason == "unknown"
+
+    asyncio.run(_go())
+
+
+def test_view_ticker_still_processes_events(tmp_path: Path) -> None:
+    """ticker view widgets receive feed_event without crashing on missing #status/#heartbeat."""
+    from control_tower.watch import EventTicker, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="ticker")
+        async with app.run_test():
+            for i in range(3):
+                app.feed_event(_parsed(_ev("cycle_start", cycle_id=f"c{i}")))
+            ticker = app.query_one("#ticker", EventTicker)
+            assert len(ticker.events) == 3
+            # role state still updates internally (it's a cheap dict)
+            assert "dev-1" in app._role_states
+
+    asyncio.run(_go())
+
+
+def test_view_stats_refresh_counters_does_not_crash_without_other_widgets(
+    tmp_path: Path,
+) -> None:
+    from control_tower.watch import CountersPane, WatchApp
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    async def _go() -> None:
+        app = WatchApp(log, from_start=True, poll_interval_s=0.05, view="stats")
+        async with app.run_test():
+            app.feed_event(_parsed(_ev("cycle_start", cycle_id="c1")))
+            app.feed_event(
+                _parsed(_ev("cycle_end", cycle_id="c1", exit_code=0, duration_s=1.0))
+            )
+            app._refresh_counters()
+            pane = app.query_one("#counters", CountersPane)
+            assert pane._cs["dev-1"].total == 1
+            assert pane._cs["dev-1"].ok == 1
+
+    asyncio.run(_go())

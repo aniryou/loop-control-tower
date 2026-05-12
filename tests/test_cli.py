@@ -181,6 +181,64 @@ def test_stats_default_path_resolves_via_env(
     assert "dev-1" in out
 
 
+def test_watch_passes_view_through_to_run_watch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--view=pulse on the CLI reaches run_watch(view='pulse')."""
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured["path"] = path
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    rc = cli.main(["watch", "--view=pulse", str(log)])
+    assert rc == 0
+    assert captured["view"] == "pulse"
+    assert captured["path"] == log
+
+
+def test_watch_view_default_is_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_tower import cli
+
+    captured: dict[str, Any] = {}
+
+    def _fake_run_watch(path: Path, **kwargs: Any) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("control_tower.watch.run_watch", _fake_run_watch)
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    cli.main(["watch", str(log)])
+    assert captured["view"] == "all"
+
+
+def test_watch_view_rejects_unknown_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from control_tower import cli
+
+    log = tmp_path / "events.jsonl"
+    log.write_text("")
+
+    with pytest.raises(SystemExit):
+        cli.main(["watch", "--view=banana", str(log)])
+    err = capsys.readouterr().err
+    assert "banana" in err or "invalid choice" in err
+
+
 def test_module_main_importable_without_executing() -> None:
     """Importing control_tower.__main__ must NOT execute main() (guard with __name__)."""
     import control_tower.__main__  # noqa: F401
